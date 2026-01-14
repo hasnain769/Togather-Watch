@@ -16,6 +16,7 @@ export default function RoomPage() {
 
     // Logic refs
     const isVoiceInterruption = useRef(false);
+    const audioRef = useRef<HTMLAudioElement>(null);
 
     const [videoState, setVideoState] = useState<VideoState>({
         playing: false,
@@ -25,6 +26,9 @@ export default function RoomPage() {
     const [seekCmd, setSeekCmd] = useState<number | null>(null);
     const [volume, setVolume] = useState(0.8);
     const [userCount, setUserCount] = useState(1);
+
+    // Audio Unlock State
+    const [isAudioUnlocked, setIsAudioUnlocked] = useState(false);
 
     // Sync Logic
     useEffect(() => {
@@ -38,11 +42,9 @@ export default function RoomPage() {
         });
 
         socket.on('video-update', (payload: VideoUpdatePayload) => {
-            // Standard sync; if we are in voice interruption, we might ignore playing=true unless manual
             if (!isVoiceInterruption.current) {
                 setVideoState(prev => ({ ...prev, playing: payload.playing, url: payload.url }));
             } else {
-                // Update URL/Ts but keep playing status controlled by interruption logic unless seek
                 setVideoState(prev => ({ ...prev, url: payload.url }));
             }
 
@@ -67,23 +69,24 @@ export default function RoomPage() {
             isVoiceInterruption.current = true;
             setVideoState(prev => ({ ...prev, playing: false }));
 
-            // 2. Play Audio
-            try {
-                const blob = new Blob([payload.audioBlob], { type: 'audio/webm' });
-                const audioUrl = URL.createObjectURL(blob);
-                const audio = new Audio(audioUrl);
-                audio.volume = 1.0;
+            // 2. Play Audio via Persisted Element
+            if (audioRef.current) {
+                try {
+                    const blob = new Blob([payload.audioBlob], { type: 'audio/webm' });
+                    const audioUrl = URL.createObjectURL(blob);
 
-                audio.onended = () => {
-                    // 3. Resume
+                    audioRef.current.src = audioUrl;
+                    audioRef.current.volume = 1.0;
+
+                    await audioRef.current.play();
+                } catch (e) {
+                    console.error("Audio play error", e);
+                    // If play fails, we should probably resume video to avoid stuck state
                     isVoiceInterruption.current = false;
-                    setVideoState(prev => ({ ...prev, playing: true }));
-                };
-
-                await audio.play();
-            } catch (e) {
-                console.error("Audio play error", e);
-                isVoiceInterruption.current = false;
+                    // We don't auto resume here if it failed, maybe user has to click play
+                }
+            } else {
+                console.error("Audio ref not defined");
             }
         });
 
@@ -98,6 +101,22 @@ export default function RoomPage() {
     }, [socket, isConnected, roomId, videoState.timestamp]);
 
     // Handlers
+    const handleAudioEnded = () => {
+        // 3. Resume Video
+        if (isVoiceInterruption.current) {
+            isVoiceInterruption.current = false;
+            setVideoState(prev => ({ ...prev, playing: true }));
+        }
+    };
+
+    const handleUnlockAudio = () => {
+        if (audioRef.current) {
+            // Play a silent logic or just init
+            audioRef.current.play().catch(() => { });
+            setIsAudioUnlocked(true);
+        }
+    };
+
     const handlePlay = (time: number) => {
         if (!socket) return;
         socket.emit('video-update', { roomId, playing: true, timestamp: time, url: videoState.url });
@@ -110,7 +129,6 @@ export default function RoomPage() {
         setVideoState(prev => ({ ...prev, playing: false }));
     };
 
-    // Toggle Play/Pause from Control Bar
     const handleTogglePlay = () => {
         if (videoState.playing) {
             handlePause(videoState.timestamp);
@@ -134,7 +152,6 @@ export default function RoomPage() {
 
     // Voice Handling (Sender)
     const handleRecordStart = async () => {
-        // Pause video locally immediately
         isVoiceInterruption.current = true;
         setVideoState(prev => ({ ...prev, playing: false }));
         await startRecording();
@@ -143,42 +160,36 @@ export default function RoomPage() {
     const handleRecordStop = async () => {
         const audioBlob = await stopRecording();
         if (audioBlob && socket) {
-            // We need to estimate duration to pause sender video too
             const tempUrl = URL.createObjectURL(audioBlob);
             const tempAudio = new Audio(tempUrl);
 
             tempAudio.onloadedmetadata = () => {
                 const duration = tempAudio.duration;
 
-                // Send note
                 socket.emit('voice-note', {
                     audioBlob: audioBlob,
                     duration: duration || 0
                 });
 
-                // Sender waits for duration too if valid
+                // Sender wait
                 if (duration && isFinite(duration)) {
                     setTimeout(() => {
                         isVoiceInterruption.current = false;
                         handlePlay(videoState.timestamp);
                     }, duration * 1000);
                 } else {
-                    // Fallback
                     isVoiceInterruption.current = false;
                     handlePlay(videoState.timestamp);
                 }
             };
 
             tempAudio.onerror = () => {
-                // Fallback if audio load fails
                 socket.emit('voice-note', { audioBlob, duration: 0 });
                 isVoiceInterruption.current = false;
                 handlePlay(videoState.timestamp);
             };
 
-            // Trigger load
             tempAudio.volume = 0;
-            // Hack to trigger metadata load in some envs
             tempAudio.currentTime = 1e101;
         } else {
             isVoiceInterruption.current = false;
@@ -190,11 +201,30 @@ export default function RoomPage() {
 
     if (!hasMounted) return <div className="h-screen w-full bg-black flex items-center justify-center text-white">Loading Room...</div>;
 
+    if (!isAudioUnlocked) {
+        return (
+            <div className="fixed inset-0 bg-black flex flex-col items-center justify-center z-50 p-4">
+                <div className="max-w-md w-full text-center space-y-6">
+                    <h1 className="text-3xl font-bold text-white tracking-wider">CINESYNC</h1>
+                    <p className="text-gray-400">Join the room to start watching and talking.</p>
+                    <button
+                        onClick={handleUnlockAudio}
+                        className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 rounded-xl text-lg shadow-lg shadow-blue-900/20 transition-all transform hover:scale-105 active:scale-95"
+                    >
+                        Tap to Join Room
+                    </button>
+                    <p className="text-gray-600 text-xs">Audio playback requires user interaction.</p>
+                </div>
+                {/* Hidden audio element to initialize ref */}
+                <audio ref={audioRef} className="hidden" />
+            </div>
+        );
+    }
+
     return (
         <div className="flex flex-col h-screen w-full bg-black overflow-hidden relative">
             <RoomHeader roomId={roomId} userCount={userCount} />
 
-            {/* Main Player Area - Centered */}
             <div className="flex-1 w-full relative flex items-center justify-center bg-black pb-24">
                 <div className="w-full h-full max-w-6xl max-h-[80vh] aspect-video shadow-2xl bg-black rounded-lg overflow-hidden border border-white/5">
                     <VideoPlayer
@@ -222,6 +252,12 @@ export default function RoomPage() {
                 onVolumeChange={setVolume}
                 currentUrl={videoState.url || ''}
                 onUrlChange={handleUrlChange}
+            />
+
+            <audio
+                ref={audioRef}
+                className="hidden"
+                onEnded={handleAudioEnded}
             />
         </div>
     );
