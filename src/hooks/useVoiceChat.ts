@@ -1,149 +1,242 @@
-import { useEffect, useRef, useState } from 'react';
+'use client';
+
+import { useEffect, useRef, useState, useCallback } from 'react';
 import SimplePeer from 'simple-peer';
-import { Socket } from 'socket.io-client';
-import { SignalPayload } from '@/lib/types';
 
 interface UseVoiceChatProps {
-    socket: Socket | null;
-    roomId: string;
-    userId: string;
+    trigger: (event: string, data: any) => void;
+    bind: (event: string, callback: (data: any) => void) => void;
+    unbind: (event: string, callback?: (data: any) => void) => void;
+    isConnected: boolean;
+    myUserId: string | null;
+    onVideoVolumeChange?: (volume: number) => void;
 }
 
-export const useVoiceChat = ({ socket, roomId, userId }: UseVoiceChatProps) => {
-    const [peers, setPeers] = useState<SimplePeer.Instance[]>([]);
-    const [stream, setStream] = useState<MediaStream | null>(null);
-    const [isMicEnabled, setIsMicEnabled] = useState(false);
-    const audioRef = useRef<HTMLAudioElement | null>(null);
-    const peersRef = useRef<{ peerID: string; peer: SimplePeer.Instance }[]>([]);
+const ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+];
 
-    useEffect(() => {
-        // Initialize local audio stream
-        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-            navigator.mediaDevices.getUserMedia({ audio: true })
-                .then((currentStream) => {
-                    setStream(currentStream);
-                    currentStream.getAudioTracks().forEach(track => track.enabled = false);
-                    setIsMicEnabled(false);
-                })
-                .catch(err => console.error('Error accessing media devices:', err));
-        } else {
-            console.warn("navigator.mediaDevices.getUserMedia is not defined. Ensure you are using HTTPS or localhost.");
+const AUDIO_CONSTRAINTS = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+};
+
+const DUCKING_THRESHOLD = 100;
+const DUCKED_VOLUME = 0.2;
+
+export const useVoiceChat = ({
+    trigger,
+    bind,
+    unbind,
+    isConnected,
+    myUserId,
+    onVideoVolumeChange,
+}: UseVoiceChatProps) => {
+    const [isMicEnabled, setIsMicEnabled] = useState(false);
+    const [isVoiceConnected, setIsVoiceConnected] = useState(false);
+    const [micVolume, setMicVolume] = useState(0);
+
+    const peerRef = useRef<SimplePeer.Instance | null>(null);
+    const streamRef = useRef<MediaStream | null>(null);
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const analyserRef = useRef<AnalyserNode | null>(null);
+    const animationFrameRef = useRef<number | null>(null);
+    const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+
+    // Cleanup
+    const cleanup = useCallback(() => {
+        if (peerRef.current) {
+            peerRef.current.destroy();
+            peerRef.current = null;
         }
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
+        }
+        if (animationFrameRef.current) {
+            cancelAnimationFrame(animationFrameRef.current);
+        }
+        if (audioContextRef.current) {
+            audioContextRef.current.close();
+            audioContextRef.current = null;
+        }
+        setIsVoiceConnected(false);
     }, []);
 
-    const toggleMic = () => {
-        if (stream) {
-            const enabled = !isMicEnabled;
-            stream.getAudioTracks().forEach(track => track.enabled = enabled);
-            setIsMicEnabled(enabled);
+    // Audio Ducking - Monitor mic volume
+    const startAudioDucking = useCallback((stream: MediaStream) => {
+        try {
+            const audioContext = new AudioContext();
+            const analyser = audioContext.createAnalyser();
+            const source = audioContext.createMediaStreamSource(stream);
+
+            analyser.fftSize = 256;
+            source.connect(analyser);
+
+            audioContextRef.current = audioContext;
+            analyserRef.current = analyser;
+
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            let userSetVolume = 1.0;
+
+            const checkVolume = () => {
+                if (!analyserRef.current) return;
+
+                analyserRef.current.getByteFrequencyData(dataArray);
+                const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+                setMicVolume(average);
+
+                // Audio ducking
+                if (onVideoVolumeChange) {
+                    if (average > DUCKING_THRESHOLD) {
+                        onVideoVolumeChange(DUCKED_VOLUME);
+                    } else {
+                        onVideoVolumeChange(userSetVolume);
+                    }
+                }
+
+                animationFrameRef.current = requestAnimationFrame(checkVolume);
+            };
+
+            checkVolume();
+        } catch (err) {
+            console.error('Audio ducking setup failed:', err);
         }
-    };
+    }, [onVideoVolumeChange]);
 
-    const createPeer = (userToSignal: string, callerID: string, stream: MediaStream) => {
-        const peer = new SimplePeer({
-            initiator: true,
-            trickle: false,
-            stream,
-        });
+    // Initialize peer connection
+    const initializePeer = useCallback(async (initiator: boolean) => {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            console.warn('getUserMedia not available (HTTPS required)');
+            return;
+        }
 
-        peer.on('signal', (signal) => {
-            socket?.emit('signal', {
-                target: userToSignal,
-                callerID,
-                signal,
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: AUDIO_CONSTRAINTS
             });
-        });
+            streamRef.current = stream;
 
-        peer.on('stream', (remoteStream) => {
-            // Assume single peer for MVP, set to audio ref
-            if (audioRef.current) {
-                audioRef.current.srcObject = remoteStream;
-                audioRef.current.play().catch(e => console.error("Auto-play failed", e));
-            }
-        });
+            // Start audio ducking
+            startAudioDucking(stream);
 
-        return peer;
-    };
-
-    const addPeer = (incomingSignal: any, callerID: string, stream: MediaStream) => {
-        const peer = new SimplePeer({
-            initiator: false,
-            trickle: false,
-            stream,
-        });
-
-        peer.on('signal', (signal) => {
-            socket?.emit('signal', {
-                target: callerID,
-                callerID: userId, // I am sending back
-                signal,
+            const peer = new SimplePeer({
+                initiator,
+                trickle: true,
+                stream,
+                config: { iceServers: ICE_SERVERS },
             });
-        });
 
-        peer.on('stream', (remoteStream) => {
-            if (audioRef.current) {
-                audioRef.current.srcObject = remoteStream;
-                audioRef.current.play().catch(e => console.error("Auto-play failed", e));
-            }
-        });
+            peer.on('signal', (signal) => {
+                trigger('client-signal', {
+                    signal,
+                    userId: myUserId
+                });
+            });
 
-        peer.signal(incomingSignal);
+            peer.on('stream', (remoteStream) => {
+                console.log('Received remote stream');
+                if (remoteAudioRef.current) {
+                    remoteAudioRef.current.srcObject = remoteStream;
+                    remoteAudioRef.current.play().catch(e => console.error('Remote audio play failed', e));
+                }
+                setIsVoiceConnected(true);
+            });
 
-        return peer;
-    };
+            peer.on('connect', () => {
+                console.log('Peer connected');
+                setIsVoiceConnected(true);
+            });
 
+            peer.on('error', (err) => {
+                console.error('Peer error:', err);
+            });
+
+            peer.on('close', () => {
+                console.log('Peer closed');
+                setIsVoiceConnected(false);
+            });
+
+            // Log ICE states for debugging
+            peer.on('iceStateChange', (state: string) => {
+                console.log('ICE state:', state);
+            });
+
+            peerRef.current = peer;
+            setIsMicEnabled(true);
+
+        } catch (err) {
+            console.error('Failed to initialize voice:', err);
+        }
+    }, [trigger, myUserId, startAudioDucking]);
+
+    // Handle incoming signals
     useEffect(() => {
-        if (!socket || !stream) return;
+        if (!isConnected) return;
 
-        socket.on('all-users', (users: string[]) => {
-            const peersList: SimplePeer.Instance[] = [];
-            users.forEach((userID) => {
-                const peer = createPeer(userID, socket.id!, stream);
-                peersRef.current.push({
-                    peerID: userID,
-                    peer,
-                });
-                peersList.push(peer);
-            });
-            setPeers(peersList);
-        });
+        const onSignal = (data: { signal: any; userId: string }) => {
+            // Ignore own signals
+            if (data.userId === myUserId) return;
 
-        socket.on('signal', (payload: any) => {
-            // payload: { signal, callerID }
-            // Check if we already have a peer for this caller
-            const item = peersRef.current.find(p => p.peerID === payload.callerID);
-            if (item) {
-                item.peer.signal(payload.signal);
+            if (peerRef.current) {
+                // Already have a peer, just signal
+                peerRef.current.signal(data.signal);
             } else {
-                // Incoming call
-                const peer = addPeer(payload.signal, payload.callerID, stream);
-                peersRef.current.push({
-                    peerID: payload.callerID,
-                    peer,
+                // No peer yet, create one as non-initiator
+                initializePeer(false).then(() => {
+                    if (peerRef.current) {
+                        peerRef.current.signal(data.signal);
+                    }
                 });
-                setPeers(prev => [...prev, peer]);
             }
-        });
+        };
 
-        socket.on('user-disconnected', (id: string) => {
-            const peerObj = peersRef.current.find(p => p.peerID === id);
-            if (peerObj) {
-                peerObj.peer.destroy();
-            }
-            peersRef.current = peersRef.current.filter(p => p.peerID !== id);
-            setPeers(peersRef.current.map(p => p.peer));
-        });
+        bind('client-signal', onSignal);
 
         return () => {
-            socket.off('all-users');
-            socket.off('signal');
-            socket.off('user-disconnected');
+            unbind('client-signal', onSignal);
         };
-    }, [socket, stream, roomId]);
+    }, [isConnected, bind, unbind, myUserId, initializePeer]);
+
+    // Toggle mic
+    const toggleMic = useCallback(() => {
+        if (streamRef.current) {
+            const enabled = !isMicEnabled;
+            streamRef.current.getAudioTracks().forEach(track => {
+                track.enabled = enabled;
+            });
+            setIsMicEnabled(enabled);
+        }
+    }, [isMicEnabled]);
+
+    // Start voice chat
+    const startVoice = useCallback(() => {
+        if (!peerRef.current) {
+            initializePeer(true);
+        }
+    }, [initializePeer]);
+
+    // End voice chat
+    const endVoice = useCallback(() => {
+        cleanup();
+    }, [cleanup]);
+
+    // Cleanup on unmount
+    useEffect(() => {
+        return () => {
+            cleanup();
+        };
+    }, [cleanup]);
 
     return {
         isMicEnabled,
+        isVoiceConnected,
+        micVolume,
         toggleMic,
-        audioRef // Ref to attach to <audio> element in UI
+        startVoice,
+        endVoice,
+        remoteAudioRef,
     };
 };

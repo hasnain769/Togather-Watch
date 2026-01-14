@@ -3,19 +3,19 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "next dev",
     "build": "next build",
-    "start": "NODE_ENV=production tsx server.ts",
+    "start": "next start",
     "lint": "eslint"
   },
   "dependencies": {
     "next": "16.1.1",
+    "pusher": "^5.3.2",
+    "pusher-js": "^8.4.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-player": "^2.16.0",
     "simple-peer": "^9.11.1",
-    "socket.io": "^4.8.3",
-    "socket.io-client": "^4.8.3",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
